@@ -1,11 +1,11 @@
 """
-Free NSE candlestick signal bot -> Telegram alerts
-Data: yfinance (free, may be slightly delayed)
-Risk:Reward = 1:2
+Free NSE candlestick signal bot -> Telegram alerts (runs on GitHub Actions)
+Data: yfinance (free, may lag a minute or two) | Risk:Reward = 1:2
 NOT financial advice. Paper trade first.
 """
 import os
 import time
+import calendar
 import datetime as dt
 import pandas as pd
 import requests
@@ -13,13 +13,13 @@ import yfinance as yf
 import pytz
 
 # ================= CONFIG =================
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]   # set in GitHub Secrets
+CHAT_ID = os.environ["CHAT_ID"]       # set in GitHub Secrets
 
 WATCHLIST = [
     # Indices
     "^NSEI", "^NSEBANK", "^BSESN",
-    # Nifty 50 stocks (Sensex's 30 are mostly a subset of these)
+    # Nifty 50 stocks
     "ADANIENT.NS", "ADANIPORTS.NS", "APOLLOHOSP.NS", "ASIANPAINT.NS",
     "AXISBANK.NS", "BAJAJ-AUTO.NS", "BAJFINANCE.NS", "BAJAJFINSV.NS",
     "BEL.NS", "BHARTIARTL.NS", "CIPLA.NS", "COALINDIA.NS", "DRREDDY.NS",
@@ -31,12 +31,22 @@ WATCHLIST = [
     "SBILIFE.NS", "SBIN.NS", "SHRIRAMFIN.NS", "SUNPHARMA.NS",
     "TATACONSUM.NS", "TATAMOTORS.NS", "TATASTEEL.NS", "TCS.NS",
     "TECHM.NS", "TITAN.NS", "TRENT.NS", "ULTRACEMCO.NS", "WIPRO.NS",
-]# add more; index: ^NSEI
+]
+
 INTERVAL = "5m"          # 5m, 15m, 1h
-CHECK_EVERY_SEC = 300
-RR = 2.0                  # risk:reward = 1:2
+RR = 2.0                 # risk:reward = 1:2
+MAX_AGE_MIN = 10         # only alert for candles that closed in the last 10 min
+LOOP_SLEEP_SEC = 60      # how often the loop re-checks
+STOP_TIME = (15, 30)     # stop at 3:30 PM IST
+
+# Option idea (indices only). Verify strike steps/expiry rules in your broker app.
+STEP = {"^NSEI": 50, "^NSEBANK": 100, "^BSESN": 100}
+EXPIRY = {"^NSEI": ("weekly", 1),      # Nifty: Tuesday
+          "^BSESN": ("weekly", 3),     # Sensex: Thursday
+          "^NSEBANK": ("monthly", 1)}  # Bank Nifty: last Tuesday of month
+
 IST = pytz.timezone("Asia/Kolkata")
-sent = set()              # avoids duplicate alerts
+sent = set()             # avoids duplicate alerts
 # ==========================================
 
 
@@ -89,9 +99,44 @@ def detect(df):
 def last_completed(df, minutes):
     now = dt.datetime.now(IST)
     last_ts = df.index[-1].tz_convert(IST)
-    if last_ts + dt.timedelta(minutes=minutes) > now:   # still forming
+    if last_ts + dt.timedelta(minutes=minutes) > now:   # candle still forming
         df = df.iloc[:-1]
     return df
+
+
+def next_expiry(sym):
+    kind, wd = EXPIRY[sym]
+    today = dt.datetime.now(IST).date()
+
+    def last_wd(y, m):
+        d = dt.date(y, m, calendar.monthrange(y, m)[1])
+        while d.weekday() != wd:
+            d -= dt.timedelta(days=1)
+        return d
+
+    if kind == "weekly":
+        d = today + dt.timedelta(days=(wd - today.weekday()) % 7)
+        if (d - today).days < 2:          # too close to expiry -> next week
+            d += dt.timedelta(days=7)
+    else:
+        d = last_wd(today.year, today.month)
+        if (d - today).days < 2:
+            y = today.year + (today.month == 12)
+            d = last_wd(y, today.month % 12 + 1)
+    return d
+
+
+def option_idea(sym, side, entry):
+    if sym not in STEP:
+        return ""
+    st = STEP[sym]
+    atm = round(entry / st) * st
+    typ = "CE" if side == "BUY" else "PE"
+    itm = atm - st if side == "BUY" else atm + st
+    exp = next_expiry(sym).strftime("%d %b")
+    return (f"\n\nOption idea: BUY {atm} {typ} (ATM)"
+            f"\nSafer alt: {itm} {typ} (1 step ITM)"
+            f"\nExpiry: {exp}")
 
 
 def scan():
@@ -106,25 +151,36 @@ def scan():
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             df = last_completed(df, mins)
-            # only alert for a candle that closed recently (no duplicates across runs)
             closed_at = df.index[-1].tz_convert(IST) + dt.timedelta(minutes=mins)
-            if (now - closed_at).total_seconds() > 25 * 60:
+            if (now - closed_at).total_seconds() > MAX_AGE_MIN * 60:
                 continue
             for name, side, stop in detect(df):
                 entry = float(df.iloc[-1].Close)
                 risk = abs(entry - stop)
                 if risk <= 0:
                     continue
+                key = (sym, str(df.index[-1]), name)
+                if key in sent:
+                    continue
+                sent.add(key)
                 target = entry + RR * risk if side == "BUY" else entry - RR * risk
-                send(f"{'🟢' if side == 'BUY' else '🔴'} {side} {sym.replace('.NS','')}\n"
+                send(f"{'🟢' if side == 'BUY' else '🔴'} {side} {sym.replace('.NS', '')}\n"
                      f"Pattern: {name} ({INTERVAL})\n"
                      f"Entry: {entry:.2f}\nStop-loss: {stop:.2f}\n"
                      f"Target (1:{RR:g}): {target:.2f}\n"
-                     f"Risk/share: {risk:.2f}")
+                     f"Risk/share: {risk:.2f}"
+                     + option_idea(sym, side, entry))
         except Exception as e:
             print(sym, "error:", e)
 
 
 if __name__ == "__main__":
-    scan()
-  
+    event = os.environ.get("GITHUB_EVENT_NAME")
+    if event == "workflow_dispatch":
+        send("✅ Test: bot is connected")
+    if event == "schedule":
+        while dt.datetime.now(IST).time() < dt.time(*STOP_TIME):
+            scan()
+            time.sleep(LOOP_SLEEP_SEC)
+    else:
+        scan()
