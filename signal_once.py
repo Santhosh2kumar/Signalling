@@ -1,5 +1,5 @@
 """
-Free NSE candlestick signal bot -> Telegram alerts (runs on GitHub Actions)
+Free NSE candlestick signal bot -> Telegram alerts + 10-min updates (GitHub Actions)
 Data: yfinance (free, may lag a minute or two) | Risk:Reward = 1:2
 NOT financial advice. Paper trade first.
 """
@@ -47,6 +47,8 @@ EXPIRY = {"^NSEI": ("weekly", 1),      # Nifty: Tuesday
 
 IST = pytz.timezone("Asia/Kolkata")
 sent = set()             # avoids duplicate alerts
+SUMMARY_EVERY_MIN = 10   # repeating status update interval
+recent = []              # signals since the last update
 # ==========================================
 
 
@@ -170,8 +172,33 @@ def scan():
                      f"Target (1:{RR:g}): {target:.2f}\n"
                      f"Risk/share: {risk:.2f}"
                      + option_idea(sym, side, entry))
+                recent.append(f"{side} {sym.replace('.NS', '')} - {name}")
         except Exception as e:
             print(sym, "error:", e)
+
+
+def summary():
+    lines = [f"📊 Update {dt.datetime.now(IST).strftime('%H:%M')}"]
+    for sym, label in [("^NSEI", "Nifty"), ("^NSEBANK", "Bank Nifty"),
+                       ("^BSESN", "Sensex")]:
+        try:
+            d = yf.download(sym, period="1d", interval="5m",
+                            progress=False, auto_adjust=False)
+            if isinstance(d.columns, pd.MultiIndex):
+                d.columns = d.columns.get_level_values(0)
+            last = float(d.Close.iloc[-1])
+            first = float(d.Open.iloc[0])
+            lines.append(f"{label}: {last:.2f} ({(last - first) / first * 100:+.2f}%)")
+        except Exception:
+            lines.append(f"{label}: n/a")
+    lines.append(f"Scanned {len(WATCHLIST)} symbols")
+    if recent:
+        lines.append(f"Signals in last {SUMMARY_EVERY_MIN} min: {len(recent)}")
+        lines += recent[:15]
+    else:
+        lines.append("No new signals")
+    send("\n".join(lines))
+    recent.clear()
 
 
 if __name__ == "__main__":
@@ -179,8 +206,12 @@ if __name__ == "__main__":
     if event == "workflow_dispatch":
         send("✅ Test: bot is connected")
     if event == "schedule":
+        last_sum = dt.datetime.now(IST)
         while dt.datetime.now(IST).time() < dt.time(*STOP_TIME):
             scan()
+            if (dt.datetime.now(IST) - last_sum).total_seconds() >= SUMMARY_EVERY_MIN * 60:
+                summary()
+                last_sum = dt.datetime.now(IST)
             time.sleep(LOOP_SLEEP_SEC)
     else:
         scan()
