@@ -1,22 +1,34 @@
 name: signal-bot
+
 on:
   schedule:
-    - cron: "40 3 * * 1-5"   # 9:10 AM IST, Mon-Fri
+    # 03:40 UTC = 9:10 AM IST (Morning Session, Mon-Fri)
+    - cron: "40 3 * * 1-5"
+    # 06:40 UTC = 12:10 PM IST (Afternoon Session, Mon-Fri)
+    - cron: "40 6 * * 1-5"
   workflow_dispatch:
+
+concurrency:
+  group: signal-bot
+  cancel-in-progress: true
+
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 400
-    concurrency:
-      group: signal-bot
-      cancel-in-progress: false
+    timeout-minutes: 210
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install yfinance pandas requests pytz
-      - run: python signal_once.py
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: pip install yfinance pandas requests pytz
+
+      - name: Run Bot Loop
+        run: python -u signal_once.py
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
